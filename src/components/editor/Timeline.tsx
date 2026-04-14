@@ -1509,7 +1509,8 @@ export function Timeline({ data, v2 }: { data: EditorData; v2?: boolean }) {
       }
 
       // Copy selected keyframes, transition, suppression, or effects
-      if (matchesHotkey(e, 'copy')) {
+      // Skip if user has text selected (let browser handle native copy)
+      if (matchesHotkey(e, 'copy') && !window.getSelection()?.toString()) {
         if (selectedKeyframeIds.size > 0) {
           e.preventDefault()
           kfClipboard.current = [...selectedKeyframeIds]
