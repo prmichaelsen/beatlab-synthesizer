@@ -188,8 +188,8 @@ export function BinPanel({ projectName, onClose, onRestore, onPoolSelect, onInse
     return m
   }, [activeKeyframes, keyframeEntries])
   const sortItems = <T extends { id: string }>(items: T[]) => {
-    if (sortBy === 'recent') return [...items].sort((a, b) => idNum(b.id) - idNum(a.id))
-    if (sortBy === 'oldest') return [...items].sort((a, b) => idNum(a.id) - idNum(b.id))
+    if (sortBy === 'recent') return [...items].sort((a, b) => (b.modified ?? idNum(b.id)) - (a.modified ?? idNum(a.id)))
+    if (sortBy === 'oldest') return [...items].sort((a, b) => (a.modified ?? idNum(a.id)) - (b.modified ?? idNum(b.id)))
     // Timeline sort: by timestamp for keyframes, by from-kf timestamp for transitions
     return [...items].sort((a, b) => {
       const aTs = 'timestamp' in a ? parseTs((a as { timestamp: string }).timestamp) : ('from' in a ? (kfTimeMap.get((a as { from: string }).from) ?? 0) : 0)
@@ -198,7 +198,7 @@ export function BinPanel({ projectName, onClose, onRestore, onPoolSelect, onInse
     })
   }
   const sortByName = <T extends { name: string }>(items: T[]) => {
-    if (sortBy === 'recent') return [...items].sort((a, b) => b.name.localeCompare(a.name))
+    if (sortBy === 'recent') return [...items].sort((a, b) => (b.modified ?? 0) - (a.modified ?? 0))
     if (sortBy === 'oldest') return [...items].sort((a, b) => a.name.localeCompare(b.name))
     return items
   }
