@@ -883,12 +883,15 @@ export function Timeline({ data, v2 }: { data: EditorData; v2?: boolean }) {
           : activeTr.opacity != null ? activeTr.opacity : track.baseOpacity
         const trElapsed = currentTime - from.timeSeconds
         let trInvert = 0
+        let effectChromaKey: { color: [number, number, number]; threshold: number; feather: number } | undefined
         for (const fx of activeTr.effects || []) {
           if (!fx.enabled) continue
           if (fx.type === 'strobe') {
             const period = fx.params.period || (1 / (fx.params.frequency || 8))
             const duty = fx.params.duty || 0.5
             if ((trElapsed / period) % 1 > duty) trOpacity = 0
+          } else if (fx.type === 'chroma-key') {
+            effectChromaKey = { color: [fx.params.r ?? 0, fx.params.g ?? 1, fx.params.b ?? 0], threshold: fx.params.threshold ?? 0.3, feather: fx.params.feather ?? 0.1 }
           } else if (fx.type === 'invert') {
             trInvert = fx.params.amount ?? 1
           }
@@ -943,7 +946,7 @@ export function Timeline({ data, v2 }: { data: EditorData; v2?: boolean }) {
           frameA = getFrameAtProgress(kfKey, 0)
         }
         const trBlend = (activeTr.blendMode || curKf?.blendMode || track.blendMode) as import('@/lib/beatlab-client').BlendMode
-        return { frameA, frameB: null, blendFactor: 0, opacity: trOpacity, red: trRed, green: trGreen, blue: trBlue, black: trBlack, saturation: trSaturation, hueShift: trHueShift, invert: trInvert, brightness: trBrightness, contrast: trContrast, exposure: trExposure, blendMode: trBlend, chromaKey: activeTr.chromaKey || track.chromaKey, mask, transform } as import('./BeatEffectPreview').TrackLayer
+        return { frameA, frameB: null, blendFactor: 0, opacity: trOpacity, red: trRed, green: trGreen, blue: trBlue, black: trBlack, saturation: trSaturation, hueShift: trHueShift, invert: trInvert, brightness: trBrightness, contrast: trContrast, exposure: trExposure, blendMode: trBlend, chromaKey: effectChromaKey || activeTr.chromaKey || track.chromaKey, mask, transform } as import('./BeatEffectPreview').TrackLayer
       }
       if (curKf) {
         const kfKey = `kf:${curKf.id}`
@@ -3122,7 +3125,7 @@ function TrackSettingsPanel({ track, onClose, onUpdate }: {
   onUpdate: (updates: Partial<Track>) => void
 }) {
   const STORAGE_KEY = 'beatlab-side-panel-width'
-  const BLEND_MODES: import('@/lib/beatlab-client').BlendMode[] = ['normal', 'multiply', 'screen', 'overlay', 'difference', 'add', 'soft-light', 'chroma-key']
+  const BLEND_MODES: import('@/lib/beatlab-client').BlendMode[] = ['normal', 'multiply', 'screen', 'overlay', 'difference', 'add', 'soft-light']
 
   const [blendMode, setBlendMode] = useState(track.blendMode)
   const [opacity, setOpacity] = useState(track.baseOpacity)

@@ -697,6 +697,7 @@ function TransitionEffectsEditor({ transition, projectName }: { transition: Tran
     const defaults: Record<string, Record<string, number>> = {
       strobe: { flashMs: 60, blackMs: 60 },
       invert: { amount: 1 },
+      'chroma-key': { r: 0, g: 1, b: 0, threshold: 0.3, feather: 0.1 },
     }
     const result = await postAddTransitionEffect(projectName, transition.id, type, defaults[type] || {})
     setEffects((prev) => [...prev, { id: result.id, type, params: defaults[type] || {}, enabled: true }])
@@ -728,6 +729,7 @@ function TransitionEffectsEditor({ transition, projectName }: { transition: Tran
           <option value="" disabled>+ Add</option>
           <option value="strobe">Strobe</option>
           <option value="invert">Invert</option>
+          <option value="chroma-key">Chroma Key</option>
         </select>
       </div>
       {effects.map((fx) => (
@@ -798,6 +800,56 @@ function TransitionEffectsEditor({ transition, projectName }: { transition: Tran
               <span className="text-[9px] text-gray-400 w-12 text-right">{Math.round((fx.params.amount ?? 1) * 100)}%</span>
             </div>
           )}
+          {fx.type === 'chroma-key' && (() => {
+            const r = fx.params.r ?? 0, g = fx.params.g ?? 1, b = fx.params.b ?? 0
+            const hexColor = `#${[r, g, b].map((c) => Math.round(c * 255).toString(16).padStart(2, '0')).join('')}`
+            return (
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-2">
+                  <span className="text-[9px] text-gray-500 w-12">Color</span>
+                  <input
+                    type="color"
+                    value={hexColor}
+                    onChange={(e) => {
+                      const hex = e.target.value
+                      const nr = parseInt(hex.slice(1, 3), 16) / 255
+                      const ng = parseInt(hex.slice(3, 5), 16) / 255
+                      const nb = parseInt(hex.slice(5, 7), 16) / 255
+                      handleUpdate(fx.id, { params: { ...fx.params, r: nr, g: ng, b: nb } })
+                    }}
+                    onBlur={() => handleUpdatePersist(fx.id, { params: fx.params })}
+                    className="w-8 h-6 rounded border border-gray-700 cursor-pointer"
+                  />
+                  <span className="text-[8px] text-gray-500 font-mono">{hexColor}</span>
+                  <div className="flex gap-0.5">
+                    <button onClick={() => { handleUpdate(fx.id, { params: { ...fx.params, r: 0, g: 1, b: 0 } }); handleUpdatePersist(fx.id, { params: { ...fx.params, r: 0, g: 1, b: 0 } }) }} className="text-[7px] px-1 py-0.5 rounded bg-green-900 text-green-300">G</button>
+                    <button onClick={() => { handleUpdate(fx.id, { params: { ...fx.params, r: 0, g: 0, b: 1 } }); handleUpdatePersist(fx.id, { params: { ...fx.params, r: 0, g: 0, b: 1 } }) }} className="text-[7px] px-1 py-0.5 rounded bg-blue-900 text-blue-300">B</button>
+                    <button onClick={() => { handleUpdate(fx.id, { params: { ...fx.params, r: 0, g: 0, b: 0 } }); handleUpdatePersist(fx.id, { params: { ...fx.params, r: 0, g: 0, b: 0 } }) }} className="text-[7px] px-1 py-0.5 rounded bg-gray-800 text-gray-300">K</button>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[9px] text-gray-500 w-12">Thresh</span>
+                  <input type="range" min={0} max={100} step={1}
+                    value={Math.round((fx.params.threshold ?? 0.3) * 100)}
+                    onChange={(e) => handleUpdate(fx.id, { params: { ...fx.params, threshold: parseInt(e.target.value) / 100 } })}
+                    onPointerUp={() => handleUpdatePersist(fx.id, { params: fx.params })}
+                    className="flex-1 h-1.5 accent-teal-500"
+                  />
+                  <span className="text-[9px] text-gray-400 w-12 text-right">{Math.round((fx.params.threshold ?? 0.3) * 100)}%</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[9px] text-gray-500 w-12">Feather</span>
+                  <input type="range" min={0} max={50} step={1}
+                    value={Math.round((fx.params.feather ?? 0.1) * 100)}
+                    onChange={(e) => handleUpdate(fx.id, { params: { ...fx.params, feather: parseInt(e.target.value) / 100 } })}
+                    onPointerUp={() => handleUpdatePersist(fx.id, { params: fx.params })}
+                    className="flex-1 h-1.5 accent-teal-500"
+                  />
+                  <span className="text-[9px] text-gray-400 w-12 text-right">{Math.round((fx.params.feather ?? 0.1) * 100)}%</span>
+                </div>
+              </div>
+            )
+          })()}
         </div>
       ))}
     </div>
