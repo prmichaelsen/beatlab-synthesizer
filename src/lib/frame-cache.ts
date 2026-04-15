@@ -269,21 +269,22 @@ export function setEvictionProtectWindow(seconds: number) {
   evictionProtectSeconds = seconds
 }
 
-function evictFarthest(protectKey?: string) {
+function evictFarthest(protectKey?: string, protectRadius?: number) {
+  const radius = protectRadius ?? evictionProtectSeconds
   let farthestKey: string | null = null
   let farthestDist = -1
   for (const key of memoryCache.keys()) {
     if (key === protectKey) continue
     const t = keyTimestamps.get(key) ?? 0
     const dist = Math.abs(t - currentPlayhead)
-    // Never evict entries close to the playhead — they're about to play
-    if (dist <= evictionProtectSeconds) continue
+    if (dist <= radius) continue
     if (dist > farthestDist) {
       farthestDist = dist
       farthestKey = key
     }
   }
   if (farthestKey) cacheDelete(farthestKey)
+  return !!farthestKey
 }
 
 function cacheSet(key: string, entry: CacheEntry) {
@@ -294,12 +295,20 @@ function cacheSet(key: string, entry: CacheEntry) {
   // Evict farthest entries from playhead when at 80% of memory limit
   // (GPU texture memory is ~2x the estimated RGBA bytes)
   const evictionThreshold = MEMORY_LIMIT * 0.8
-  let evictAttempts = 0
-  while (totalMemoryBytes > evictionThreshold && memoryCache.size > 1 && evictAttempts < 50) {
-    const before = totalMemoryBytes
-    evictFarthest(key)
-    if (totalMemoryBytes >= before) break // nothing evictable (all protected)
-    evictAttempts++
+  if (totalMemoryBytes <= evictionThreshold) return
+
+  // Phase 1: evict outside the protection zone
+  let attempts = 0
+  while (totalMemoryBytes > evictionThreshold && memoryCache.size > 1 && attempts < 50) {
+    if (!evictFarthest(key)) break
+    attempts++
+  }
+  if (totalMemoryBytes <= MEMORY_LIMIT) return
+
+  // Phase 2: over the hard limit — shrink protection to 5s (just the about-to-play clips)
+  while (totalMemoryBytes > MEMORY_LIMIT && memoryCache.size > 1 && attempts < 100) {
+    if (!evictFarthest(key, 5)) break
+    attempts++
   }
 }
 
