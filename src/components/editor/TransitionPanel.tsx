@@ -96,6 +96,17 @@ export function TransitionPanel({
   const [tab, setTabRaw] = useState<'details' | 'candidates' | 'browse' | 'bench'>(_lastTrTab)
   const setTab = useCallback((t: 'details' | 'candidates' | 'browse' | 'bench') => { _lastTrTab = t; setTabRaw(t) }, [])
   const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const tabScrollRef = useRef<HTMLDivElement>(null)
+  const tabScrollPos = useRef(0)
+  // Persist tab scroll across re-renders (hover preview causes parent re-render)
+  useEffect(() => {
+    const el = tabScrollRef.current
+    if (!el) return
+    el.scrollTop = tabScrollPos.current
+    const onScroll = () => { tabScrollPos.current = el.scrollTop }
+    el.addEventListener('scroll', onScroll)
+    return () => el.removeEventListener('scroll', onScroll)
+  })
 
   useEffect(() => {
     if (scrollContainerRef.current && _lastTrScroll > 0) {
@@ -187,7 +198,7 @@ export function TransitionPanel({
         {/* Tabs */}
         <TabBar tab={tab} setTab={setTab} candidateCount={totalCandidates} />
 
-        <div className="flex-1 overflow-y-auto">
+        <div ref={tabScrollRef} className="flex-1 overflow-y-auto">
           {tab === 'details' ? (
             <>
               {/* Hidden toggle */}
