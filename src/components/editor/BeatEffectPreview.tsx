@@ -866,6 +866,12 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
     }
   }, [])
 
+  // Variant cache infrastructure — preserved but not used in the render loop for now.
+  // Reference these to prevent TS6133 unused-var errors until we re-enable variants.
+  void shaderFlagsKey
+  void shaderFlagsForLayer
+  void compileVariant
+
 
   // Init WebGL on mount or when canvas dimensions change
   useEffect(() => {
@@ -1000,36 +1006,23 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
     const texs = [ctx.compAccumTex, ctx.compAccumTex2]
     const aspectRatio = canvas.width / canvas.height
 
+    // Use monolithic compositor shader — variant cache infrastructure exists but is
+    // disabled in the render loop for stability. Re-enable via variantCache once
+    // crash reports are resolved. See Task 31 / 32.
+    gl.useProgram(ctx.compProgram)
+    const locs = ctx.compLocs
+    // Sampler units are program state — bind once per program use
+    gl.uniform1i(locs.u_base, 0)
+    gl.uniform1i(locs.u_layerA, 1)
+    gl.uniform1i(locs.u_layerB, 2)
+
     for (let i = 0; i < contentLayers.length; i++) {
       const layer = contentLayers[i]
       const writeIdx = 1 - readIdx
       // Invariant: readIdx !== writeIdx (required for FBO read-after-write correctness on all drivers)
 
-      // Phase 3: select a variant program for this layer's active flags
-      // Variants are smaller shaders with dead branches removed — better register usage.
-      // Uniforms not present in the variant have null location (gl.uniform* is a no-op on null).
-      const flags = shaderFlagsForLayer(layer)
-      const variantKey = shaderFlagsKey(flags)
-      let variant = ctx.variantCache.get(variantKey)
-      if (!variant) {
-        const compiled = compileVariant(gl, ctx.compVs, flags)
-        if (compiled) {
-          ctx.variantCache.set(variantKey, compiled)
-          variant = compiled
-        }
-      }
-      // Fall back to monolithic shader if variant compile fails
-      const program = variant?.program ?? ctx.compProgram
-      const locs = variant?.locs ?? ctx.compLocs
-
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[writeIdx])
       gl.viewport(0, 0, canvas.width, canvas.height)
-      gl.useProgram(program)
-
-      // Sampler uniforms (rebound per program switch — program state)
-      gl.uniform1i(locs.u_base, 0)
-      gl.uniform1i(locs.u_layerA, 1)
-      gl.uniform1i(locs.u_layerB, 2)
 
       // unit 0 = accumulator (previous result) — bound to texs[readIdx], never texs[writeIdx]
       gl.activeTexture(gl.TEXTURE0)
@@ -1055,8 +1048,7 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
         gl.bindTexture(gl.TEXTURE_2D, ctx.blackTex)
       }
 
-      // Upload uniforms — null locations (from disabled features in this variant) are no-ops.
-      // Monolithic fallback uses its compLocs (all present), so these are always valid uploads.
+      // Upload uniforms (cached locations — no per-draw lookup)
       gl.uniform1f(locs.u_layerBlend, layer.blendFactor)
       gl.uniform1f(locs.u_opacity, layer.opacity)
       gl.uniform1f(locs.u_red, layer.red ?? 1)
@@ -1069,10 +1061,9 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
       gl.uniform1f(locs.u_brightness, layer.brightness ?? 0)
       gl.uniform1f(locs.u_contrast, layer.contrast ?? 1)
       gl.uniform1f(locs.u_exposure, layer.exposure ?? 0)
-      // u_blendMode/u_hasChromaKey/u_isAdjustment are only used by monolithic fallback
-      if (locs.u_blendMode) gl.uniform1i(locs.u_blendMode, BLEND_MODE_MAP[layer.blendMode] ?? 0)
-      if (locs.u_hasChromaKey) gl.uniform1f(locs.u_hasChromaKey, layer.chromaKey ? 1.0 : 0.0)
-      if (locs.u_isAdjustment) gl.uniform1f(locs.u_isAdjustment, layer.isAdjustment ? 1.0 : 0.0)
+      gl.uniform1i(locs.u_blendMode, BLEND_MODE_MAP[layer.blendMode] ?? 0)
+      gl.uniform1f(locs.u_hasChromaKey, layer.chromaKey ? 1.0 : 0.0)
+      gl.uniform1f(locs.u_isAdjustment, layer.isAdjustment ? 1.0 : 0.0)
 
       const ck = layer.chromaKey
       gl.uniform3f(locs.u_keyColor, ck?.color[0] ?? 0, ck?.color[1] ?? 1, ck?.color[2] ?? 0)
