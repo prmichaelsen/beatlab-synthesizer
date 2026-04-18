@@ -854,24 +854,31 @@ export function Timeline({ data, v2 }: { data: EditorData; v2?: boolean }) {
       const curKf = [...tKfs].reverse().find((kf) => kf.timeSeconds <= currentTime)
       // Find active transition for this track
       const tKfMap = new Map(tKfs.map((kf) => [kf.id, kf]))
-      // Find transition spanning current time — highest z-index (last/highest ID) wins when overlapping
-      // Check if current time falls within any hidden transition — if so, skip this layer entirely
-      const inHiddenTr = tTrs.some((tr) => {
-        if (!tr.hidden) return false
-        const from = tKfMap.get(tr.from)
-        const to = tKfMap.get(tr.to)
-        if (!from || !to) return false
-        return currentTime >= from.timeSeconds && currentTime < to.timeSeconds
-      })
-      if (inHiddenTr) {
-        return { frameA: null, frameB: null, blendFactor: 0, opacity: 0, red: 1, green: 1, blue: 1, black: 0, saturation: 1, hueShift: 0, invert: 0, brightness: 0, contrast: 1, exposure: 0, blendMode: track.blendMode, chromaKey: track.chromaKey } as import('./BeatEffectPreview').TrackLayer
-      }
+      // Pick the highest-ID NON-HIDDEN transition spanning current time.
+      // Hidden trs are skipped here so they don't become active, but they also don't
+      // mask out overlapping visible trs on the same track.
       const activeTr = tTrs.filter((tr) => {
+        if (tr.hidden) return false
         const from = tKfMap.get(tr.from)
         const to = tKfMap.get(tr.to)
         if (!from || !to) return false
         return currentTime >= from.timeSeconds && currentTime < to.timeSeconds
       }).at(-1) ?? null
+
+      // If only hidden trs cover this time (no visible activeTr AND some hidden tr is here),
+      // render layer transparent so the track "mutes" as expected.
+      if (!activeTr) {
+        const onlyHiddenHere = tTrs.some((tr) => {
+          if (!tr.hidden) return false
+          const from = tKfMap.get(tr.from)
+          const to = tKfMap.get(tr.to)
+          if (!from || !to) return false
+          return currentTime >= from.timeSeconds && currentTime < to.timeSeconds
+        })
+        if (onlyHiddenHere) {
+          return { frameA: null, frameB: null, blendFactor: 0, opacity: 0, red: 1, green: 1, blue: 1, black: 0, saturation: 1, hueShift: 0, invert: 0, brightness: 0, contrast: 1, exposure: 0, blendMode: track.blendMode, chromaKey: track.chromaKey } as import('./BeatEffectPreview').TrackLayer
+        }
+      }
       if (activeTr) {
         const from = tKfMap.get(activeTr.from)!
         const to = tKfMap.get(activeTr.to)!
