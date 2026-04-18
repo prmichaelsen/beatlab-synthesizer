@@ -166,6 +166,38 @@ milestones:
         estimated_hours: 4
         actual_hours: null
 
+  - id: milestone_6
+    name: WebGL Compositor Performance
+    status: not_started
+    started: null
+    completed: null
+    file: agent/milestones/milestone-6-webgl-compositor-performance.md
+    tasks_total: 3
+    tasks_completed: 0
+    estimated_weeks: 2
+    tasks:
+      - id: task-28
+        name: "Phase 1: Texture upload optimization"
+        status: not_started
+        started: null
+        file: agent/tasks/milestone-6-webgl-compositor-performance/task-28-phase1-texture-upload.md
+        estimated_hours: 6
+        actual_hours: null
+      - id: task-29
+        name: "Phase 2: Sync stall audit + ping-pong fix"
+        status: not_started
+        started: null
+        file: agent/tasks/milestone-6-webgl-compositor-performance/task-29-phase2-sync-audit.md
+        estimated_hours: 4
+        actual_hours: null
+      - id: task-30
+        name: "Phase 3: Shader variant cache"
+        status: not_started
+        started: null
+        file: agent/tasks/milestone-6-webgl-compositor-performance/task-30-phase3-shader-variants.md
+        estimated_hours: 6
+        actual_hours: null
+
   - id: milestone_4
     name: AI Assistant Chat
     status: not_started
@@ -347,6 +379,31 @@ tasks:
       estimated_hours: 4
       actual_hours: null
       started: null
+  milestone_6:
+    - id: task-28
+      name: "Phase 1: Texture upload optimization"
+      status: not_started
+      milestone_id: milestone_6
+      file: agent/tasks/milestone-6-webgl-compositor-performance/task-28-phase1-texture-upload.md
+      estimated_hours: 6
+      actual_hours: null
+      started: null
+    - id: task-29
+      name: "Phase 2: Sync stall audit + ping-pong fix"
+      status: not_started
+      milestone_id: milestone_6
+      file: agent/tasks/milestone-6-webgl-compositor-performance/task-29-phase2-sync-audit.md
+      estimated_hours: 4
+      actual_hours: null
+      started: null
+    - id: task-30
+      name: "Phase 3: Shader variant cache"
+      status: not_started
+      milestone_id: milestone_6
+      file: agent/tasks/milestone-6-webgl-compositor-performance/task-30-phase3-shader-variants.md
+      estimated_hours: 6
+      actual_hours: null
+      started: null
   milestone_4:
     - id: task-15
       name: Backend chat endpoint and DB storage
@@ -447,10 +504,10 @@ tasks:
       started: null
 
 documentation:
-  design_documents: 9
-  milestone_documents: 3
+  design_documents: 10
+  milestone_documents: 4
   pattern_documents: 0
-  task_documents: 27
+  task_documents: 30
 
 progress:
   planning: 80
