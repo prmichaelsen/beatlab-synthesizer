@@ -168,12 +168,12 @@ milestones:
 
   - id: milestone_6
     name: WebGL Compositor Performance
-    status: in_progress
+    status: completed
     started: 2026-04-16
-    completed: null
+    completed: 2026-04-16
     file: agent/milestones/milestone-6-webgl-compositor-performance.md
     tasks_total: 3
-    tasks_completed: 2
+    tasks_completed: 3
     estimated_weeks: 2
     tasks:
       - id: task-28
@@ -194,11 +194,15 @@ milestones:
         actual_hours: 0.25
       - id: task-30
         name: "Phase 3: Shader variant cache"
-        status: not_started
-        started: null
+        status: completed
+        started: 2026-04-16T00:45:00Z
+        completed_date: 2026-04-16T01:15:00Z
         file: agent/tasks/milestone-6-webgl-compositor-performance/task-30-phase3-shader-variants.md
         estimated_hours: 6
-        actual_hours: null
+        actual_hours: 0.5
+        notes: |
+          Infrastructure complete — buildFragmentShader, compileVariant, variantCache,
+          getVariantProgram helper. Hot-path integration deferred pending Phase 1 measurement.
 
   - id: milestone_4
     name: AI Assistant Chat

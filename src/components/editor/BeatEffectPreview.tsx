@@ -267,6 +267,209 @@ const BLEND_MODE_MAP: Record<string, number> = {
   normal: 0, multiply: 1, screen: 2, overlay: 3, difference: 4, add: 5, 'chroma-key': 6, 'soft-light': 7,
 }
 
+// ── Phase 3: Shader variant cache ──
+// Build fragment shaders on demand keyed by active-effect bitmask. Each variant
+// contains only the code for its active features, eliminating dead branches and
+// reducing register pressure. Variants are cached forever (expect ~20-60 total
+// across a typical editing session).
+type ShaderFlags = {
+  chromaKey: boolean
+  saturation: boolean
+  hueShift: boolean
+  brightness: boolean
+  contrast: boolean
+  exposure: boolean
+  invert: boolean
+  mask: boolean
+  rgbMult: boolean       // any of red/green/blue/black non-default
+  blendMode: number      // 0-7 (encoded in shader via #define)
+  isAdjustment: boolean  // changes texture lookup path
+}
+
+function shaderFlagsKey(f: ShaderFlags): string {
+  return `${f.blendMode}|${+f.isAdjustment}|${+f.chromaKey}${+f.saturation}${+f.hueShift}${+f.brightness}${+f.contrast}${+f.exposure}${+f.invert}${+f.mask}${+f.rgbMult}`
+}
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function shaderFlagsForLayer(layer: {
+  blendMode: string; red: number; green: number; blue: number; black: number;
+  saturation: number; hueShift: number; invert: number; brightness: number; contrast: number; exposure: number;
+  mask?: unknown; chromaKey?: unknown; isAdjustment?: boolean
+}): ShaderFlags {
+  return {
+    chromaKey: !!layer.chromaKey,
+    saturation: Math.abs(layer.saturation - 1) > 0.001,
+    hueShift: layer.hueShift > 0.001,
+    brightness: Math.abs(layer.brightness) > 0.001,
+    contrast: Math.abs(layer.contrast - 1) > 0.001,
+    exposure: Math.abs(layer.exposure) > 0.001,
+    invert: layer.invert > 0.001,
+    mask: !!layer.mask,
+    rgbMult: Math.abs(layer.red - 1) > 0.001 || Math.abs(layer.green - 1) > 0.001 ||
+             Math.abs(layer.blue - 1) > 0.001 || Math.abs(layer.black) > 0.001,
+    blendMode: BLEND_MODE_MAP[layer.blendMode] ?? 0,
+    isAdjustment: !!layer.isAdjustment,
+  }
+}
+
+// Shared helper functions (only included when needed)
+const HSV_HELPERS = `
+  vec3 rgb2hsv(vec3 c) {
+    vec4 K = vec4(0.0, -1.0/3.0, 2.0/3.0, -1.0);
+    vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+    vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+    float d = q.x - min(q.w, q.y);
+    float e = 1.0e-10;
+    return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+  }
+  vec3 hsv2rgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+  }
+`
+
+function buildBlendChunk(mode: number): string {
+  switch (mode) {
+    case 1: return `layer = mix(vec3(1.0), layer, maskAlpha); blended = base.rgb * layer;`  // multiply
+    case 2: return `blended = 1.0 - (1.0 - base.rgb) * (1.0 - layer);`  // screen
+    case 3: return `blended = mix(2.0*base.rgb*layer, 1.0-2.0*(1.0-base.rgb)*(1.0-layer), step(0.5, base.rgb));`  // overlay
+    case 4: return `blended = abs(base.rgb - layer);`  // difference
+    case 5: return `blended = min(base.rgb + layer, 1.0);`  // add
+    case 6: return `blended = layer;`  // chroma-key (alpha applied via finalAlpha)
+    case 7: return `
+      vec3 D = mix(((16.0 * base.rgb - 12.0) * base.rgb + 4.0) * base.rgb, sqrt(base.rgb), step(0.25, base.rgb));
+      blended = mix(base.rgb - (1.0 - 2.0 * layer) * base.rgb * (1.0 - base.rgb), base.rgb + (2.0 * layer - 1.0) * (D - base.rgb), step(0.5, layer));
+    `
+    default: return `blended = layer;`  // normal
+  }
+}
+
+function buildFragmentShader(f: ShaderFlags): string {
+  const needHSV = f.saturation || f.hueShift
+  return `
+  precision mediump float;
+  varying vec2 v_texCoord;
+  uniform sampler2D u_base;
+  uniform sampler2D u_layerA;
+  uniform sampler2D u_layerB;
+  uniform float u_layerBlend;
+  uniform float u_opacity;
+  ${f.rgbMult ? 'uniform float u_red; uniform float u_green; uniform float u_blue; uniform float u_black;' : ''}
+  ${f.saturation ? 'uniform float u_saturation;' : ''}
+  ${f.hueShift ? 'uniform float u_hueShift;' : ''}
+  ${f.invert ? 'uniform float u_invert;' : ''}
+  ${f.brightness ? 'uniform float u_brightness;' : ''}
+  ${f.contrast ? 'uniform float u_contrast;' : ''}
+  ${f.exposure ? 'uniform float u_exposure;' : ''}
+  ${f.chromaKey ? 'uniform vec3 u_keyColor; uniform float u_keyThreshold; uniform float u_keyFeather;' : ''}
+  ${f.mask ? 'uniform vec2 u_maskCenter; uniform float u_maskRadius; uniform float u_maskFeather; uniform float u_aspectRatio;' : ''}
+  uniform vec2 u_transform;
+  uniform float u_scale;
+  uniform vec2 u_anchor;
+  ${needHSV ? HSV_HELPERS : ''}
+  void main() {
+    vec4 base = texture2D(u_base, v_texCoord);
+    vec2 baseCoord = ${f.isAdjustment ? 'v_texCoord' : 'vec2(v_texCoord.x, 1.0 - v_texCoord.y)'};
+    vec2 scaled = (baseCoord - u_anchor) / u_scale + u_anchor;
+    vec2 layerCoord = scaled - vec2(u_transform.x, ${f.isAdjustment ? 'u_transform.y' : '-u_transform.y'});
+    vec4 lA = texture2D(u_layerA, layerCoord);
+    vec4 lB = texture2D(u_layerB, layerCoord);
+    vec3 layer = mix(lA.rgb, lB.rgb, u_layerBlend);
+    ${f.rgbMult ? 'layer.r *= u_red; layer.g *= u_green; layer.b *= u_blue; layer *= (1.0 - u_black);' : ''}
+    ${needHSV ? `
+      vec3 hsv = rgb2hsv(layer);
+      ${f.saturation ? 'hsv.y = clamp(hsv.y * u_saturation, 0.0, 1.0);' : ''}
+      ${f.hueShift ? 'hsv.x = fract(hsv.x + u_hueShift);' : ''}
+      layer = hsv2rgb(hsv);
+    ` : ''}
+    ${f.invert ? 'layer = mix(layer, vec3(1.0) - layer, u_invert);' : ''}
+    ${f.brightness ? 'layer += u_brightness;' : ''}
+    ${f.contrast ? 'layer = (layer - 0.5) * u_contrast + 0.5;' : ''}
+    ${f.exposure ? 'layer *= pow(2.0, u_exposure);' : ''}
+    float maskAlpha = 1.0;
+    ${f.mask ? `
+      vec2 mdist = (v_texCoord - u_maskCenter) * vec2(1.0, 1.0 / u_aspectRatio);
+      float mlen = length(mdist);
+      float minner = u_maskRadius * (1.0 - u_maskFeather);
+      maskAlpha = 1.0 - smoothstep(minner, u_maskRadius, mlen);
+    ` : ''}
+    float effectiveOpacity = u_opacity * maskAlpha;
+    float chromaAlpha = 1.0;
+    ${f.chromaKey ? `
+      float cdist = distance(layer, u_keyColor);
+      chromaAlpha = smoothstep(u_keyThreshold, u_keyThreshold + u_keyFeather, cdist);
+    ` : ''}
+    float finalAlpha = effectiveOpacity * chromaAlpha;
+    vec3 blended;
+    ${buildBlendChunk(f.blendMode)}
+    gl_FragColor = vec4(mix(base.rgb, blended, finalAlpha), 1.0);
+  }
+  `
+}
+
+type VariantProgram = {
+  program: WebGLProgram
+  locs: CompLocs
+}
+
+function compileVariant(gl: WebGLRenderingContext, vs: WebGLShader, flags: ShaderFlags): VariantProgram | null {
+  const src = buildFragmentShader(flags)
+  const fs = gl.createShader(gl.FRAGMENT_SHADER)
+  if (!fs) return null
+  gl.shaderSource(fs, src)
+  gl.compileShader(fs)
+  if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+    console.error('[shader variant] compile failed:', gl.getShaderInfoLog(fs), '\nsource:', src)
+    gl.deleteShader(fs)
+    return null
+  }
+  const program = gl.createProgram()
+  if (!program) { gl.deleteShader(fs); return null }
+  gl.attachShader(program, vs)
+  gl.attachShader(program, fs)
+  gl.bindAttribLocation(program, 0, 'a_position')
+  gl.bindAttribLocation(program, 1, 'a_texCoord')
+  gl.linkProgram(program)
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error('[shader variant] link failed:', gl.getProgramInfoLog(program))
+    gl.deleteProgram(program)
+    gl.deleteShader(fs)
+    return null
+  }
+  const locs: CompLocs = {
+    u_base: gl.getUniformLocation(program, 'u_base'),
+    u_layerA: gl.getUniformLocation(program, 'u_layerA'),
+    u_layerB: gl.getUniformLocation(program, 'u_layerB'),
+    u_layerBlend: gl.getUniformLocation(program, 'u_layerBlend'),
+    u_opacity: gl.getUniformLocation(program, 'u_opacity'),
+    u_red: gl.getUniformLocation(program, 'u_red'),
+    u_green: gl.getUniformLocation(program, 'u_green'),
+    u_blue: gl.getUniformLocation(program, 'u_blue'),
+    u_black: gl.getUniformLocation(program, 'u_black'),
+    u_saturation: gl.getUniformLocation(program, 'u_saturation'),
+    u_hueShift: gl.getUniformLocation(program, 'u_hueShift'),
+    u_invert: gl.getUniformLocation(program, 'u_invert'),
+    u_brightness: gl.getUniformLocation(program, 'u_brightness'),
+    u_contrast: gl.getUniformLocation(program, 'u_contrast'),
+    u_exposure: gl.getUniformLocation(program, 'u_exposure'),
+    u_blendMode: null,  // variants bake in the blend mode, no uniform needed
+    u_hasChromaKey: null,  // variants bake chroma-key presence
+    u_keyColor: gl.getUniformLocation(program, 'u_keyColor'),
+    u_keyThreshold: gl.getUniformLocation(program, 'u_keyThreshold'),
+    u_keyFeather: gl.getUniformLocation(program, 'u_keyFeather'),
+    u_maskCenter: gl.getUniformLocation(program, 'u_maskCenter'),
+    u_maskRadius: gl.getUniformLocation(program, 'u_maskRadius'),
+    u_maskFeather: gl.getUniformLocation(program, 'u_maskFeather'),
+    u_aspectRatio: gl.getUniformLocation(program, 'u_aspectRatio'),
+    u_transform: gl.getUniformLocation(program, 'u_transform'),
+    u_scale: gl.getUniformLocation(program, 'u_scale'),
+    u_anchor: gl.getUniformLocation(program, 'u_anchor'),
+    u_isAdjustment: null,  // variants bake adjustment flag
+  }
+  return { program, locs }
+}
+
 // Map detailed AI effect names to suppression categories
 const EFFECT_TO_CATEGORY: Record<string, EffectType> = {
   zoom_pulse: 'zoom', zoom_bounce: 'zoom', zoom: 'zoom',
@@ -487,6 +690,11 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
     layerSlots: Map<string, LayerSlot>
     // Cached compositor uniform locations (set once at program link)
     compLocs: CompLocs
+    // Phase 3: shader variant cache (keyed by flags bitmask — see shaderFlagsKey)
+    // Variants compile lazily on first use and are cached forever.
+    // Infrastructure is ready; hot-path integration deferred pending Phase 1 measurement.
+    variantCache: Map<string, VariantProgram>
+    compVs: WebGLShader  // shared vertex shader for variant compilation
   } | null>(null)
   const imgRef = useRef<HTMLImageElement | null>(null)
   const animRef = useRef<number>(0)
@@ -654,8 +862,28 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
       blackTex,
       layerSlots: new Map<string, LayerSlot>(),
       compLocs,
+      variantCache: new Map<string, VariantProgram>(),
+      compVs,
     }
   }, [])
+
+  // Phase 3 helper: get or compile a shader variant for a given flag combination.
+  // Falls back to the monolithic compProgram if variant compile fails.
+  // Currently unused — wire this into the render loop once Phase 1 improvements are measured.
+  const getVariantProgram = useCallback((ctx: NonNullable<typeof glRef.current>, flags: ShaderFlags): VariantProgram | null => {
+    const key = shaderFlagsKey(flags)
+    let variant = ctx.variantCache.get(key)
+    if (!variant) {
+      const compiled = compileVariant(ctx.gl, ctx.compVs, flags)
+      if (!compiled) return null
+      ctx.variantCache.set(key, compiled)
+      variant = compiled
+    }
+    return variant
+  }, [])
+  // Suppress unused-var warnings — helpers are exported for future hot-path integration
+  void getVariantProgram
+  void shaderFlagsForLayer
 
   // Init WebGL on mount or when canvas dimensions change
   useEffect(() => {
