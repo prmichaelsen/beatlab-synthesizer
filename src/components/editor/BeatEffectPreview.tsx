@@ -290,7 +290,6 @@ function shaderFlagsKey(f: ShaderFlags): string {
   return `${f.blendMode}|${+f.isAdjustment}|${+f.chromaKey}${+f.saturation}${+f.hueShift}${+f.brightness}${+f.contrast}${+f.exposure}${+f.invert}${+f.mask}${+f.rgbMult}`
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function shaderFlagsForLayer(layer: {
   blendMode: string; red: number; green: number; blue: number; black: number;
   saturation: number; hueShift: number; invert: number; brightness: number; contrast: number; exposure: number;
@@ -867,23 +866,6 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
     }
   }, [])
 
-  // Phase 3 helper: get or compile a shader variant for a given flag combination.
-  // Falls back to the monolithic compProgram if variant compile fails.
-  // Currently unused — wire this into the render loop once Phase 1 improvements are measured.
-  const getVariantProgram = useCallback((ctx: NonNullable<typeof glRef.current>, flags: ShaderFlags): VariantProgram | null => {
-    const key = shaderFlagsKey(flags)
-    let variant = ctx.variantCache.get(key)
-    if (!variant) {
-      const compiled = compileVariant(ctx.gl, ctx.compVs, flags)
-      if (!compiled) return null
-      ctx.variantCache.set(key, compiled)
-      variant = compiled
-    }
-    return variant
-  }, [])
-  // Suppress unused-var warnings — helpers are exported for future hot-path integration
-  void getVariantProgram
-  void shaderFlagsForLayer
 
   // Init WebGL on mount or when canvas dimensions change
   useEffect(() => {
@@ -1016,23 +998,38 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
     let readIdx = 0
     const fbos = [ctx.compFbo, ctx.compFbo2]
     const texs = [ctx.compAccumTex, ctx.compAccumTex2]
-    const locs = ctx.compLocs
     const aspectRatio = canvas.width / canvas.height
-
-    gl.useProgram(ctx.compProgram)
-    // Sampler units are fixed per draw — bind them once
-    gl.uniform1i(locs.u_base, 0)
-    gl.uniform1i(locs.u_layerA, 1)
-    gl.uniform1i(locs.u_layerB, 2)
 
     for (let i = 0; i < contentLayers.length; i++) {
       const layer = contentLayers[i]
       const writeIdx = 1 - readIdx
       // Invariant: readIdx !== writeIdx (required for FBO read-after-write correctness on all drivers)
-      // If this ever fails, we'd be sampling from the texture we're writing to — undefined behavior.
+
+      // Phase 3: select a variant program for this layer's active flags
+      // Variants are smaller shaders with dead branches removed — better register usage.
+      // Uniforms not present in the variant have null location (gl.uniform* is a no-op on null).
+      const flags = shaderFlagsForLayer(layer)
+      const variantKey = shaderFlagsKey(flags)
+      let variant = ctx.variantCache.get(variantKey)
+      if (!variant) {
+        const compiled = compileVariant(gl, ctx.compVs, flags)
+        if (compiled) {
+          ctx.variantCache.set(variantKey, compiled)
+          variant = compiled
+        }
+      }
+      // Fall back to monolithic shader if variant compile fails
+      const program = variant?.program ?? ctx.compProgram
+      const locs = variant?.locs ?? ctx.compLocs
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[writeIdx])
       gl.viewport(0, 0, canvas.width, canvas.height)
+      gl.useProgram(program)
+
+      // Sampler uniforms (rebound per program switch — program state)
+      gl.uniform1i(locs.u_base, 0)
+      gl.uniform1i(locs.u_layerA, 1)
+      gl.uniform1i(locs.u_layerB, 2)
 
       // unit 0 = accumulator (previous result) — bound to texs[readIdx], never texs[writeIdx]
       gl.activeTexture(gl.TEXTURE0)
@@ -1042,7 +1039,6 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
       const slotB = slotsForLayers[i * 2 + 1]
 
       if (layer.isAdjustment) {
-        // Adjustment layer: feed the accumulator as both base and layer
         gl.activeTexture(gl.TEXTURE1)
         gl.bindTexture(gl.TEXTURE_2D, texs[readIdx])
         gl.activeTexture(gl.TEXTURE2)
@@ -1053,14 +1049,14 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
         gl.activeTexture(gl.TEXTURE2)
         gl.bindTexture(gl.TEXTURE_2D, slotB.tex)
       } else {
-        // Empty layer — black fill
         gl.activeTexture(gl.TEXTURE1)
         gl.bindTexture(gl.TEXTURE_2D, ctx.blackTex)
         gl.activeTexture(gl.TEXTURE2)
         gl.bindTexture(gl.TEXTURE_2D, ctx.blackTex)
       }
 
-      // Use cached uniform locations (was: gl.getUniformLocation per draw)
+      // Upload uniforms — null locations (from disabled features in this variant) are no-ops.
+      // Monolithic fallback uses its compLocs (all present), so these are always valid uploads.
       gl.uniform1f(locs.u_layerBlend, layer.blendFactor)
       gl.uniform1f(locs.u_opacity, layer.opacity)
       gl.uniform1f(locs.u_red, layer.red ?? 1)
@@ -1073,10 +1069,12 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
       gl.uniform1f(locs.u_brightness, layer.brightness ?? 0)
       gl.uniform1f(locs.u_contrast, layer.contrast ?? 1)
       gl.uniform1f(locs.u_exposure, layer.exposure ?? 0)
-      gl.uniform1i(locs.u_blendMode, BLEND_MODE_MAP[layer.blendMode] ?? 0)
+      // u_blendMode/u_hasChromaKey/u_isAdjustment are only used by monolithic fallback
+      if (locs.u_blendMode) gl.uniform1i(locs.u_blendMode, BLEND_MODE_MAP[layer.blendMode] ?? 0)
+      if (locs.u_hasChromaKey) gl.uniform1f(locs.u_hasChromaKey, layer.chromaKey ? 1.0 : 0.0)
+      if (locs.u_isAdjustment) gl.uniform1f(locs.u_isAdjustment, layer.isAdjustment ? 1.0 : 0.0)
 
       const ck = layer.chromaKey
-      gl.uniform1f(locs.u_hasChromaKey, ck ? 1.0 : 0.0)
       gl.uniform3f(locs.u_keyColor, ck?.color[0] ?? 0, ck?.color[1] ?? 1, ck?.color[2] ?? 0)
       gl.uniform1f(locs.u_keyThreshold, ck?.threshold ?? 0.3)
       gl.uniform1f(locs.u_keyFeather, ck?.feather ?? 0.1)
@@ -1090,7 +1088,6 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
       gl.uniform2f(locs.u_transform, tfm?.x ?? 0, tfm?.y ?? 0)
       gl.uniform1f(locs.u_scale, tfm?.scale ?? 1.0)
       gl.uniform2f(locs.u_anchor, tfm?.anchorX ?? 0.5, tfm?.anchorY ?? 0.5)
-      gl.uniform1f(locs.u_isAdjustment, layer.isAdjustment ? 1.0 : 0.0)
 
       gl.drawArrays(gl.TRIANGLES, 0, 6)
       readIdx = writeIdx
