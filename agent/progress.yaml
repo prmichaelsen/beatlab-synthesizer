@@ -173,7 +173,7 @@ milestones:
     completed: null
     file: agent/milestones/milestone-6-webgl-compositor-performance.md
     tasks_total: 3
-    tasks_completed: 1
+    tasks_completed: 2
     estimated_weeks: 2
     tasks:
       - id: task-28
@@ -186,11 +186,12 @@ milestones:
         actual_hours: 0.5
       - id: task-29
         name: "Phase 2: Sync stall audit + ping-pong fix"
-        status: not_started
-        started: null
+        status: completed
+        started: 2026-04-16T00:30:00Z
+        completed_date: 2026-04-16T00:45:00Z
         file: agent/tasks/milestone-6-webgl-compositor-performance/task-29-phase2-sync-audit.md
         estimated_hours: 4
-        actual_hours: null
+        actual_hours: 0.25
       - id: task-30
         name: "Phase 3: Shader variant cache"
         status: not_started

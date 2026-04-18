@@ -800,11 +800,13 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
     for (let i = 0; i < contentLayers.length; i++) {
       const layer = contentLayers[i]
       const writeIdx = 1 - readIdx
+      // Invariant: readIdx !== writeIdx (required for FBO read-after-write correctness on all drivers)
+      // If this ever fails, we'd be sampling from the texture we're writing to — undefined behavior.
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[writeIdx])
       gl.viewport(0, 0, canvas.width, canvas.height)
 
-      // unit 0 = accumulator (previous result) — NEVER same as writeIdx
+      // unit 0 = accumulator (previous result) — bound to texs[readIdx], never texs[writeIdx]
       gl.activeTexture(gl.TEXTURE0)
       gl.bindTexture(gl.TEXTURE_2D, texs[readIdx])
 
