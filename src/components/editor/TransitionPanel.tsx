@@ -711,12 +711,18 @@ function TransitionEffectsEditor({ transition, projectName }: { transition: Tran
       'chroma-key': { r: 0, g: 1, b: 0, threshold: 0.3, feather: 0.1 },
     }
     const result = await postAddTransitionEffect(projectName, transition.id, type, defaults[type] || {})
-    setEffects((prev) => [...prev, { id: result.id, type, params: defaults[type] || {}, enabled: true }])
+    const newEffect = { id: result.id, type, params: defaults[type] || {}, enabled: true }
+    setEffects((prev) => [...prev, newEffect])
+    transition.effects = [...(transition.effects || []), newEffect]
   }, [projectName, transition.id])
 
   const handleUpdate = useCallback((id: string, updates: { params?: Record<string, number>; enabled?: boolean }) => {
-    setEffects((prev) => prev.map((e) => e.id === id ? { ...e, ...updates } : e))
-  }, [])
+    setEffects((prev) => {
+      const updated = prev.map((e) => e.id === id ? { ...e, ...updates } : e)
+      transition.effects = updated
+      return updated
+    })
+  }, [transition])
   const handleUpdatePersist = useCallback(async (id: string, updates: { params?: Record<string, number>; enabled?: boolean }) => {
     const { postUpdateTransitionEffect } = await import('@/lib/beatlab-client')
     await postUpdateTransitionEffect(projectName, id, updates)
@@ -725,7 +731,11 @@ function TransitionEffectsEditor({ transition, projectName }: { transition: Tran
   const handleDelete = useCallback(async (id: string) => {
     const { postDeleteTransitionEffect } = await import('@/lib/beatlab-client')
     await postDeleteTransitionEffect(projectName, id)
-    setEffects((prev) => prev.filter((e) => e.id !== id))
+    setEffects((prev) => {
+      const updated = prev.filter((e) => e.id !== id)
+      transition.effects = updated
+      return updated
+    })
   }, [projectName])
 
   return (

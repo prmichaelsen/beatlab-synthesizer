@@ -1584,7 +1584,16 @@ export function Timeline({ data, v2 }: { data: EditorData; v2?: boolean }) {
           e.preventDefault()
           import('@/lib/beatlab-client').then(({ postPasteGroup }) => {
             postPasteGroup(data.projectName, kfClipboard.current, secondsToTimestamp(currentTimeRef.current), selectedTrackId)
-              .then(() => refreshTimeline())
+              .then((result: { skipped?: unknown[]; clearedGhosts?: unknown[] }) => {
+                if (result.skipped && result.skipped.length > 0) {
+                  alert(`Paste warning: ${result.skipped.length} transitions skipped (overlap with existing content). See console for details.`)
+                  console.warn('Paste skipped transitions:', result.skipped)
+                }
+                if (result.clearedGhosts && result.clearedGhosts.length > 0) {
+                  console.log(`Paste cleared ${result.clearedGhosts.length} ghost transitions to make room:`, result.clearedGhosts)
+                }
+                refreshTimeline()
+              })
               .catch((err: Error) => { console.error('Paste group failed:', err); alert(`Paste failed: ${err.message}`) })
           })
         } else if (supClipboard.current.length > 0) {

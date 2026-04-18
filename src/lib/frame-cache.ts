@@ -123,43 +123,60 @@ async function decodeVideoFrames(videoUrl: string, onProgress?: (progress: numbe
       if (duration <= SHORT_CLIP_THRESHOLD && 'requestVideoFrameCallback' in video) {
         // Playback-based capture: play the video and grab frames as they render.
         // Much faster than seeking for short clips.
-        const frames: ImageBitmap[] = []
+        //
+        // Deterministic variant: track captures *initiated* (not just completed)
+        // so async createImageBitmap races can't cause us to over-capture or
+        // short-circuit the loop before the final frame is captured. Resolve
+        // only after all pending bitmap promises settle.
+        const pendingBitmaps: Promise<ImageBitmap>[] = []
         const interval = duration / frameCount
         let nextCapture = 0
+        let capturesInitiated = 0
+        let resolved = false
+
+        const captureFrame = () => {
+          ctx.drawImage(video, 0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT)
+          const p = createImageBitmap(canvas)
+          pendingBitmaps.push(p)
+          capturesInitiated++
+          p.then(() => { onProgress?.(capturesInitiated / frameCount) })
+        }
+
+        const finalize = async () => {
+          if (resolved) return
+          resolved = true
+          // If we didn't manage to capture enough frames, grab a final frame
+          // from whatever the video currently shows to pad up to frameCount.
+          while (capturesInitiated < frameCount) {
+            captureFrame()
+          }
+          const frames = await Promise.all(pendingBitmaps)
+          video.src = ''
+          resolve(frames)
+        }
 
         const captureLoop = () => {
-          if (video.currentTime >= nextCapture && frames.length < frameCount) {
-            ctx.drawImage(video, 0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT)
-            createImageBitmap(canvas).then((bmp) => {
-              frames.push(bmp)
-              onProgress?.(frames.length / frameCount)
-            })
+          // Capture every interval we've crossed, not just one at a time —
+          // requestVideoFrameCallback may fire less often than 60Hz.
+          while (video.currentTime >= nextCapture && capturesInitiated < frameCount) {
+            captureFrame()
             nextCapture += interval
           }
-          if (!video.paused && !video.ended && frames.length < frameCount) {
+          if (capturesInitiated >= frameCount) {
+            finalize()
+            return
+          }
+          if (!video.ended) {
             (video as HTMLVideoElement & { requestVideoFrameCallback: (cb: () => void) => void }).requestVideoFrameCallback(captureLoop)
           }
         }
 
-        video.onended = () => {
-          // Capture final frame if needed
-          if (frames.length < frameCount) {
-            ctx.drawImage(video, 0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT)
-            createImageBitmap(canvas).then((bmp) => {
-              frames.push(bmp)
-              onProgress?.(1)
-              video.src = ''
-              resolve(frames)
-            })
-          } else {
-            video.src = ''
-            resolve(frames)
-          }
-        }
+        video.onended = () => { finalize() }
 
         ;(video as HTMLVideoElement & { requestVideoFrameCallback: (cb: () => void) => void }).requestVideoFrameCallback(captureLoop)
         video.play().catch(() => {
           // Playback failed (e.g. autoplay blocked) — fall back to seek-based
+          resolved = true // prevent onended/loop from also resolving
           decodeViaSeek(video, canvas, ctx, frameCount, fps, onProgress).then((f) => { video.src = ''; resolve(f) })
         })
       } else {
