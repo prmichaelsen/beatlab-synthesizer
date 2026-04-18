@@ -161,6 +161,7 @@ const COMPOSITE_SHADER = `
   uniform float u_scale;        // layer scale (1.0 = no scale)
   uniform vec2 u_anchor;        // scale pivot point (default 0.5, 0.5)
   uniform float u_isAdjustment; // 1.0 = adjustment layer (skip Y-flip)
+  uniform float u_hasChromaKey; // 1.0 = apply chroma key alpha masking before blend
 
   vec3 rgb2hsv(vec3 c) {
     vec4 K = vec4(0.0, -1.0/3.0, 2.0/3.0, -1.0);
@@ -224,6 +225,14 @@ const COMPOSITE_SHADER = `
     }
     float effectiveOpacity = u_opacity * maskAlpha;
 
+    // Chroma key: compute per-pixel alpha (0 = keyed out, 1 = visible)
+    float chromaAlpha = 1.0;
+    if (u_hasChromaKey > 0.5) {
+      float cdist = distance(layer, u_keyColor);
+      chromaAlpha = smoothstep(u_keyThreshold, u_keyThreshold + u_keyFeather, cdist);
+    }
+    float finalAlpha = effectiveOpacity * chromaAlpha;
+
     // Blend mode identity: what the layer should become when fully masked out
     // For multiply: identity is white (base * 1 = base)
     // For all others: mix(base, blended, 0) = base, so identity doesn't matter
@@ -235,13 +244,7 @@ const COMPOSITE_SHADER = `
     else if (u_blendMode == 3) { blended = mix(2.0*base.rgb*layer, 1.0-2.0*(1.0-base.rgb)*(1.0-layer), step(0.5, base.rgb)); } // overlay
     else if (u_blendMode == 4) { blended = abs(base.rgb - layer); }                            // difference
     else if (u_blendMode == 5) { blended = min(base.rgb + layer, 1.0); }                       // add
-    else if (u_blendMode == 6) {                                                                // chroma key
-      float cdist = distance(layer, u_keyColor);
-      float calpha = smoothstep(u_keyThreshold, u_keyThreshold + u_keyFeather, cdist);
-      blended = mix(base.rgb, layer, calpha);
-      gl_FragColor = vec4(mix(base.rgb, blended, effectiveOpacity), 1.0);
-      return;
-    }
+    else if (u_blendMode == 6) { blended = layer; }                                            // chroma-key (legacy: treat as normal, chroma applied via finalAlpha)
     else if (u_blendMode == 7) {                                                                // soft-light (W3C spec)
       vec3 D = mix(
         ((16.0 * base.rgb - 12.0) * base.rgb + 4.0) * base.rgb,
@@ -256,7 +259,7 @@ const COMPOSITE_SHADER = `
     }
     else { blended = layer; }                                                                   // normal
 
-    gl_FragColor = vec4(mix(base.rgb, blended, effectiveOpacity), 1.0);
+    gl_FragColor = vec4(mix(base.rgb, blended, finalAlpha), 1.0);
   }
 `
 
@@ -357,6 +360,96 @@ function findEffectIntensity(
 
 type EffectValues = { zoom: number; shakeX: number; shakeY: number; contrastPop: number; glowSwell: number; flash: number; echo: number }
 
+// Phase 1 optimization: per-layer texture slot
+// Pre-allocated texture storage + identity-skip upload via texSubImage2D
+type LayerSlot = {
+  tex: WebGLTexture
+  w: number
+  h: number
+  lastSource: TexImageSource | null
+}
+
+type CompLocs = {
+  u_base: WebGLUniformLocation | null
+  u_layerA: WebGLUniformLocation | null
+  u_layerB: WebGLUniformLocation | null
+  u_layerBlend: WebGLUniformLocation | null
+  u_opacity: WebGLUniformLocation | null
+  u_red: WebGLUniformLocation | null
+  u_green: WebGLUniformLocation | null
+  u_blue: WebGLUniformLocation | null
+  u_black: WebGLUniformLocation | null
+  u_saturation: WebGLUniformLocation | null
+  u_hueShift: WebGLUniformLocation | null
+  u_invert: WebGLUniformLocation | null
+  u_brightness: WebGLUniformLocation | null
+  u_contrast: WebGLUniformLocation | null
+  u_exposure: WebGLUniformLocation | null
+  u_blendMode: WebGLUniformLocation | null
+  u_hasChromaKey: WebGLUniformLocation | null
+  u_keyColor: WebGLUniformLocation | null
+  u_keyThreshold: WebGLUniformLocation | null
+  u_keyFeather: WebGLUniformLocation | null
+  u_maskCenter: WebGLUniformLocation | null
+  u_maskRadius: WebGLUniformLocation | null
+  u_maskFeather: WebGLUniformLocation | null
+  u_aspectRatio: WebGLUniformLocation | null
+  u_transform: WebGLUniformLocation | null
+  u_scale: WebGLUniformLocation | null
+  u_anchor: WebGLUniformLocation | null
+  u_isAdjustment: WebGLUniformLocation | null
+}
+
+/**
+ * Get or create a texture slot for a layer.
+ * Reallocates storage if dimensions changed.
+ */
+function getOrCreateLayerSlot(
+  gl: WebGLRenderingContext,
+  slots: Map<string, LayerSlot>,
+  key: string,
+  w: number,
+  h: number,
+): LayerSlot {
+  let slot = slots.get(key)
+  if (slot && (slot.w !== w || slot.h !== h)) {
+    // Dimensions changed — reallocate
+    gl.deleteTexture(slot.tex)
+    slot = undefined
+  }
+  if (!slot) {
+    const tex = gl.createTexture()!
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+    // Allocate storage once — per-frame uploads will use texSubImage2D
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    slot = { tex, w, h, lastSource: null }
+    slots.set(key, slot)
+  }
+  return slot
+}
+
+/**
+ * Upload a frame to a layer slot. Skips upload if the source reference is unchanged (identity skip).
+ * Uses texSubImage2D for zero-alloc in-place update.
+ */
+function uploadLayerFrame(gl: WebGLRenderingContext, slot: LayerSlot, source: TexImageSource) {
+  if (slot.lastSource === source) return  // identity skip — no upload needed
+  gl.bindTexture(gl.TEXTURE_2D, slot.tex)
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, source)
+  slot.lastSource = source
+}
+
+function getSourceDims(source: TexImageSource): { w: number; h: number } {
+  if (source instanceof HTMLVideoElement) return { w: source.videoWidth, h: source.videoHeight }
+  if (source instanceof HTMLImageElement) return { w: source.naturalWidth, h: source.naturalHeight }
+  // ImageBitmap, HTMLCanvasElement, OffscreenCanvas, ImageData
+  return { w: (source as { width: number }).width, h: (source as { height: number }).height }
+}
+
 export type BeatEffectPreviewHandle = {
   getCanvas: () => HTMLCanvasElement | null
 }
@@ -389,6 +482,11 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
     compFbo2: WebGLFramebuffer
     compAccumTex2: WebGLTexture
     blackTex: WebGLTexture
+    // Per-layer texture slot pool (Phase 1 optimization)
+    // Maps (layer index + 'A'|'B') → slot for identity-skip + zero-alloc upload
+    layerSlots: Map<string, LayerSlot>
+    // Cached compositor uniform locations (set once at program link)
+    compLocs: CompLocs
   } | null>(null)
   const imgRef = useRef<HTMLImageElement | null>(null)
   const animRef = useRef<number>(0)
@@ -397,6 +495,10 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
   const initGL = useCallback((canvas: HTMLCanvasElement) => {
     const gl = canvas.getContext('webgl', { premultipliedAlpha: false })
     if (!gl) return null
+
+    // Phase 1: set pixel store state once (toggling forces bitmap re-decode in Chromium)
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false)
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
 
     // Compile shaders
     const vs = gl.createShader(gl.VERTEX_SHADER)!
@@ -497,6 +599,38 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
 
+    // Phase 1: cache all compositor uniform locations once (avoid per-draw lookup)
+    const compLocs: CompLocs = {
+      u_base: gl.getUniformLocation(compProgram, 'u_base'),
+      u_layerA: gl.getUniformLocation(compProgram, 'u_layerA'),
+      u_layerB: gl.getUniformLocation(compProgram, 'u_layerB'),
+      u_layerBlend: gl.getUniformLocation(compProgram, 'u_layerBlend'),
+      u_opacity: gl.getUniformLocation(compProgram, 'u_opacity'),
+      u_red: gl.getUniformLocation(compProgram, 'u_red'),
+      u_green: gl.getUniformLocation(compProgram, 'u_green'),
+      u_blue: gl.getUniformLocation(compProgram, 'u_blue'),
+      u_black: gl.getUniformLocation(compProgram, 'u_black'),
+      u_saturation: gl.getUniformLocation(compProgram, 'u_saturation'),
+      u_hueShift: gl.getUniformLocation(compProgram, 'u_hueShift'),
+      u_invert: gl.getUniformLocation(compProgram, 'u_invert'),
+      u_brightness: gl.getUniformLocation(compProgram, 'u_brightness'),
+      u_contrast: gl.getUniformLocation(compProgram, 'u_contrast'),
+      u_exposure: gl.getUniformLocation(compProgram, 'u_exposure'),
+      u_blendMode: gl.getUniformLocation(compProgram, 'u_blendMode'),
+      u_hasChromaKey: gl.getUniformLocation(compProgram, 'u_hasChromaKey'),
+      u_keyColor: gl.getUniformLocation(compProgram, 'u_keyColor'),
+      u_keyThreshold: gl.getUniformLocation(compProgram, 'u_keyThreshold'),
+      u_keyFeather: gl.getUniformLocation(compProgram, 'u_keyFeather'),
+      u_maskCenter: gl.getUniformLocation(compProgram, 'u_maskCenter'),
+      u_maskRadius: gl.getUniformLocation(compProgram, 'u_maskRadius'),
+      u_maskFeather: gl.getUniformLocation(compProgram, 'u_maskFeather'),
+      u_aspectRatio: gl.getUniformLocation(compProgram, 'u_aspectRatio'),
+      u_transform: gl.getUniformLocation(compProgram, 'u_transform'),
+      u_scale: gl.getUniformLocation(compProgram, 'u_scale'),
+      u_anchor: gl.getUniformLocation(compProgram, 'u_anchor'),
+      u_isAdjustment: gl.getUniformLocation(compProgram, 'u_isAdjustment'),
+    }
+
     return {
       gl,
       program,
@@ -518,6 +652,8 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
       compFbo2: accum2.fbo,
       compAccumTex2: accum2.tex,
       blackTex,
+      layerSlots: new Map<string, LayerSlot>(),
+      compLocs,
     }
   }, [])
 
@@ -546,12 +682,7 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
     img.crossOrigin = 'anonymous'
     img.onload = () => {
       imgRef.current = img
-      const ctx = glRef.current
-      if (!ctx) return
-      ctx.gl.activeTexture(ctx.gl.TEXTURE0)
-      ctx.gl.bindTexture(ctx.gl.TEXTURE_2D, ctx.textureA)
-      ctx.gl.texImage2D(ctx.gl.TEXTURE_2D, 0, ctx.gl.RGBA, ctx.gl.RGBA, ctx.gl.UNSIGNED_BYTE, img)
-      // Draw once immediately
+      // Draw once immediately — render() will upload via the layer slot pool
       render({ zoom: 0, shakeX: 0, shakeY: 0, contrastPop: 0, glowSwell: 0, flash: 0, echo: 0 }, 0)
     }
     img.src = src
@@ -577,15 +708,35 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
 
     // ── Single render path: always go through FBO compositor ──
     // Build content layers from tracks, or fall back to legacy single-frame sources
-    const contentLayers: { frameA: TexImageSource | null; frameB: TexImageSource | null; blendFactor: number; opacity: number; red: number; green: number; blue: number; black: number; saturation: number; hueShift: number; invert: number; blendMode: string; chromaKey?: { color: number[]; threshold: number; feather: number }; isAdjustment?: boolean; mask?: { centerX: number; centerY: number; radius: number; feather: number }; transform?: { x: number; y: number } }[] = []
+    type ContentLayer = {
+      frameA: TexImageSource | null
+      frameB: TexImageSource | null
+      blendFactor: number
+      opacity: number
+      red: number
+      green: number
+      blue: number
+      black: number
+      saturation: number
+      hueShift: number
+      invert: number
+      brightness: number
+      contrast: number
+      exposure: number
+      blendMode: string
+      chromaKey?: { color: number[]; threshold: number; feather: number }
+      isAdjustment?: boolean
+      mask?: { centerX: number; centerY: number; radius: number; feather: number }
+      transform?: { x: number; y: number; scale?: number; anchorX?: number; anchorY?: number }
+    }
+    const contentLayers: ContentLayer[] = []
 
     if (layers && layers.length > 0) {
       for (const l of layers) {
         if (l.isAdjustment) {
-          // Adjustment layers have no content — they modify the composite below
-          contentLayers.push({ frameA: null, frameB: null, blendFactor: 0, opacity: l.opacity, red: l.red ?? 1, green: l.green ?? 1, blue: l.blue ?? 1, black: l.black ?? 0, saturation: l.saturation ?? 1, hueShift: l.hueShift ?? 0, invert: l.invert ?? 0, blendMode: 'normal', isAdjustment: true, mask: l.mask, transform: l.transform })
+          contentLayers.push({ frameA: null, frameB: null, blendFactor: 0, opacity: l.opacity, red: l.red ?? 1, green: l.green ?? 1, blue: l.blue ?? 1, black: l.black ?? 0, saturation: l.saturation ?? 1, hueShift: l.hueShift ?? 0, invert: l.invert ?? 0, brightness: l.brightness ?? 0, contrast: l.contrast ?? 1, exposure: l.exposure ?? 0, blendMode: 'normal', isAdjustment: true, mask: l.mask, transform: l.transform })
         } else if (l.frameA) {
-          contentLayers.push({ frameA: l.frameA, frameB: l.frameB || l.frameA, blendFactor: l.blendFactor, opacity: l.opacity, red: l.red ?? 1, green: l.green ?? 1, blue: l.blue ?? 1, black: l.black ?? 0, saturation: l.saturation ?? 1, hueShift: l.hueShift ?? 0, invert: l.invert ?? 0, blendMode: l.blendMode, chromaKey: l.chromaKey as never, mask: l.mask, transform: l.transform })
+          contentLayers.push({ frameA: l.frameA, frameB: l.frameB || l.frameA, blendFactor: l.blendFactor, opacity: l.opacity, red: l.red ?? 1, green: l.green ?? 1, blue: l.blue ?? 1, black: l.black ?? 0, saturation: l.saturation ?? 1, hueShift: l.hueShift ?? 0, invert: l.invert ?? 0, brightness: l.brightness ?? 0, contrast: l.contrast ?? 1, exposure: l.exposure ?? 0, blendMode: l.blendMode, chromaKey: l.chromaKey as never, mask: l.mask, transform: l.transform })
         }
       }
     }
@@ -593,11 +744,42 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
     if (contentLayers.length === 0) {
       const fallbackA = transitionFrameA || imgRef.current
       if (!fallbackA) return
-      contentLayers.push({ frameA: fallbackA, frameB: transitionFrameB || fallbackA, blendFactor: blend, opacity: 1, red: 1, green: 1, blue: 1, black: 0, saturation: 1, hueShift: 0, invert: 0, blendMode: 'normal' })
+      contentLayers.push({ frameA: fallbackA, frameB: transitionFrameB || fallbackA, blendFactor: blend, opacity: 1, red: 1, green: 1, blue: 1, black: 0, saturation: 1, hueShift: 0, invert: 0, brightness: 0, contrast: 1, exposure: 0, blendMode: 'normal' })
+    }
+
+    // ── Phase 1: upload pass first (pipelined with prior-frame rendering) ──
+    // For each layer, allocate a texture slot of the right size and upload the frame
+    // with identity-skip (same ImageBitmap reference = no upload). Uses texSubImage2D
+    // (zero-alloc) after the initial texImage2D.
+    const slotsForLayers: (LayerSlot | null)[] = new Array(contentLayers.length * 2)
+    for (let i = 0; i < contentLayers.length; i++) {
+      const layer = contentLayers[i]
+      if (layer.isAdjustment || !layer.frameA) {
+        slotsForLayers[i * 2] = null
+        slotsForLayers[i * 2 + 1] = null
+        continue
+      }
+      // Frame A
+      const dimsA = getSourceDims(layer.frameA)
+      if (dimsA.w > 0 && dimsA.h > 0) {
+        const slotA = getOrCreateLayerSlot(gl, ctx.layerSlots, `${i}:A`, dimsA.w, dimsA.h)
+        uploadLayerFrame(gl, slotA, layer.frameA)
+        slotsForLayers[i * 2] = slotA
+      }
+      // Frame B (if present and different from A)
+      if (layer.frameB && layer.frameB !== layer.frameA) {
+        const dimsB = getSourceDims(layer.frameB)
+        if (dimsB.w > 0 && dimsB.h > 0) {
+          const slotB = getOrCreateLayerSlot(gl, ctx.layerSlots, `${i}:B`, dimsB.w, dimsB.h)
+          uploadLayerFrame(gl, slotB, layer.frameB)
+          slotsForLayers[i * 2 + 1] = slotB
+        }
+      } else {
+        slotsForLayers[i * 2 + 1] = slotsForLayers[i * 2]  // frame B = frame A
+      }
     }
 
     // Clear FBO to black, then composite ALL layers (including base) via ping-pong
-    // This ensures base layer opacity/blend is applied correctly
     gl.bindFramebuffer(gl.FRAMEBUFFER, ctx.compFbo)
     gl.viewport(0, 0, canvas.width, canvas.height)
     gl.clearColor(0, 0, 0, 1)
@@ -606,6 +788,14 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
     let readIdx = 0
     const fbos = [ctx.compFbo, ctx.compFbo2]
     const texs = [ctx.compAccumTex, ctx.compAccumTex2]
+    const locs = ctx.compLocs
+    const aspectRatio = canvas.width / canvas.height
+
+    gl.useProgram(ctx.compProgram)
+    // Sampler units are fixed per draw — bind them once
+    gl.uniform1i(locs.u_base, 0)
+    gl.uniform1i(locs.u_layerA, 1)
+    gl.uniform1i(locs.u_layerB, 2)
 
     for (let i = 0; i < contentLayers.length; i++) {
       const layer = contentLayers[i]
@@ -613,73 +803,64 @@ export const BeatEffectPreview = forwardRef<BeatEffectPreviewHandle, BeatEffectP
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[writeIdx])
       gl.viewport(0, 0, canvas.width, canvas.height)
-      gl.useProgram(ctx.compProgram)
 
-      // unit 0 = accumulator (previous result)
+      // unit 0 = accumulator (previous result) — NEVER same as writeIdx
       gl.activeTexture(gl.TEXTURE0)
       gl.bindTexture(gl.TEXTURE_2D, texs[readIdx])
-      gl.uniform1i(gl.getUniformLocation(ctx.compProgram, 'u_base'), 0)
+
+      const slotA = slotsForLayers[i * 2]
+      const slotB = slotsForLayers[i * 2 + 1]
 
       if (layer.isAdjustment) {
         // Adjustment layer: feed the accumulator as both base and layer
-        // The shader applies RGB/black/hueShift to the existing composite
         gl.activeTexture(gl.TEXTURE1)
         gl.bindTexture(gl.TEXTURE_2D, texs[readIdx])
-        gl.uniform1i(gl.getUniformLocation(ctx.compProgram, 'u_layerA'), 1)
         gl.activeTexture(gl.TEXTURE2)
         gl.bindTexture(gl.TEXTURE_2D, texs[readIdx])
-        gl.uniform1i(gl.getUniformLocation(ctx.compProgram, 'u_layerB'), 2)
-      } else if (layer.frameA) {
-        // unit 1 = layer frame A
+      } else if (slotA && slotB) {
         gl.activeTexture(gl.TEXTURE1)
-        gl.bindTexture(gl.TEXTURE_2D, ctx.textureA)
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, layer.frameA)
-        gl.uniform1i(gl.getUniformLocation(ctx.compProgram, 'u_layerA'), 1)
-
-        // unit 2 = layer frame B
+        gl.bindTexture(gl.TEXTURE_2D, slotA.tex)
         gl.activeTexture(gl.TEXTURE2)
-        gl.bindTexture(gl.TEXTURE_2D, ctx.textureB)
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, layer.frameB!)
-        gl.uniform1i(gl.getUniformLocation(ctx.compProgram, 'u_layerB'), 2)
+        gl.bindTexture(gl.TEXTURE_2D, slotB.tex)
       } else {
-        // Empty layer (no video/image) — render as black
+        // Empty layer — black fill
         gl.activeTexture(gl.TEXTURE1)
         gl.bindTexture(gl.TEXTURE_2D, ctx.blackTex)
-        gl.uniform1i(gl.getUniformLocation(ctx.compProgram, 'u_layerA'), 1)
         gl.activeTexture(gl.TEXTURE2)
         gl.bindTexture(gl.TEXTURE_2D, ctx.blackTex)
-        gl.uniform1i(gl.getUniformLocation(ctx.compProgram, 'u_layerB'), 2)
       }
 
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_layerBlend'), layer.blendFactor)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_opacity'), layer.opacity)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_red'), layer.red ?? 1)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_green'), layer.green ?? 1)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_blue'), layer.blue ?? 1)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_black'), layer.black ?? 0)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_saturation'), layer.saturation ?? 1)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_hueShift'), layer.hueShift ?? 0)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_invert'), layer.invert ?? 0)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_brightness'), layer.brightness ?? 0)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_contrast'), layer.contrast ?? 1)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_exposure'), layer.exposure ?? 0)
-      gl.uniform1i(gl.getUniformLocation(ctx.compProgram, 'u_blendMode'), BLEND_MODE_MAP[layer.blendMode] ?? 0)
+      // Use cached uniform locations (was: gl.getUniformLocation per draw)
+      gl.uniform1f(locs.u_layerBlend, layer.blendFactor)
+      gl.uniform1f(locs.u_opacity, layer.opacity)
+      gl.uniform1f(locs.u_red, layer.red ?? 1)
+      gl.uniform1f(locs.u_green, layer.green ?? 1)
+      gl.uniform1f(locs.u_blue, layer.blue ?? 1)
+      gl.uniform1f(locs.u_black, layer.black ?? 0)
+      gl.uniform1f(locs.u_saturation, layer.saturation ?? 1)
+      gl.uniform1f(locs.u_hueShift, layer.hueShift ?? 0)
+      gl.uniform1f(locs.u_invert, layer.invert ?? 0)
+      gl.uniform1f(locs.u_brightness, layer.brightness ?? 0)
+      gl.uniform1f(locs.u_contrast, layer.contrast ?? 1)
+      gl.uniform1f(locs.u_exposure, layer.exposure ?? 0)
+      gl.uniform1i(locs.u_blendMode, BLEND_MODE_MAP[layer.blendMode] ?? 0)
 
       const ck = layer.chromaKey
-      gl.uniform3f(gl.getUniformLocation(ctx.compProgram, 'u_keyColor'), ck?.color[0] ?? 0, ck?.color[1] ?? 1, ck?.color[2] ?? 0)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_keyThreshold'), ck?.threshold ?? 0.3)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_keyFeather'), ck?.feather ?? 0.1)
+      gl.uniform1f(locs.u_hasChromaKey, ck ? 1.0 : 0.0)
+      gl.uniform3f(locs.u_keyColor, ck?.color[0] ?? 0, ck?.color[1] ?? 1, ck?.color[2] ?? 0)
+      gl.uniform1f(locs.u_keyThreshold, ck?.threshold ?? 0.3)
+      gl.uniform1f(locs.u_keyFeather, ck?.feather ?? 0.1)
 
       const mask = layer.mask
-      gl.uniform2f(gl.getUniformLocation(ctx.compProgram, 'u_maskCenter'), mask?.centerX ?? 0.5, mask?.centerY ?? 0.5)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_maskRadius'), mask?.radius ?? 1.0)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_maskFeather'), mask?.feather ?? 0.0)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_aspectRatio'), canvas.width / canvas.height)
+      gl.uniform2f(locs.u_maskCenter, mask?.centerX ?? 0.5, mask?.centerY ?? 0.5)
+      gl.uniform1f(locs.u_maskRadius, mask?.radius ?? 1.0)
+      gl.uniform1f(locs.u_maskFeather, mask?.feather ?? 0.0)
+      gl.uniform1f(locs.u_aspectRatio, aspectRatio)
       const tfm = layer.transform
-      gl.uniform2f(gl.getUniformLocation(ctx.compProgram, 'u_transform'), tfm?.x ?? 0, tfm?.y ?? 0)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_scale'), tfm?.scale ?? 1.0)
-      gl.uniform2f(gl.getUniformLocation(ctx.compProgram, 'u_anchor'), tfm?.anchorX ?? 0.5, tfm?.anchorY ?? 0.5)
-      gl.uniform1f(gl.getUniformLocation(ctx.compProgram, 'u_isAdjustment'), layer.isAdjustment ? 1.0 : 0.0)
+      gl.uniform2f(locs.u_transform, tfm?.x ?? 0, tfm?.y ?? 0)
+      gl.uniform1f(locs.u_scale, tfm?.scale ?? 1.0)
+      gl.uniform2f(locs.u_anchor, tfm?.anchorX ?? 0.5, tfm?.anchorY ?? 0.5)
+      gl.uniform1f(locs.u_isAdjustment, layer.isAdjustment ? 1.0 : 0.0)
 
       gl.drawArrays(gl.TRIANGLES, 0, 6)
       readIdx = writeIdx

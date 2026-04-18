@@ -168,21 +168,22 @@ milestones:
 
   - id: milestone_6
     name: WebGL Compositor Performance
-    status: not_started
-    started: null
+    status: in_progress
+    started: 2026-04-16
     completed: null
     file: agent/milestones/milestone-6-webgl-compositor-performance.md
     tasks_total: 3
-    tasks_completed: 0
+    tasks_completed: 1
     estimated_weeks: 2
     tasks:
       - id: task-28
         name: "Phase 1: Texture upload optimization"
-        status: not_started
-        started: null
+        status: completed
+        started: 2026-04-16T00:00:00Z
+        completed_date: 2026-04-16T00:30:00Z
         file: agent/tasks/milestone-6-webgl-compositor-performance/task-28-phase1-texture-upload.md
         estimated_hours: 6
-        actual_hours: null
+        actual_hours: 0.5
       - id: task-29
         name: "Phase 2: Sync stall audit + ping-pong fix"
         status: not_started
