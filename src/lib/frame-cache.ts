@@ -260,7 +260,10 @@ export function setCacheMemoryLimit(gb: number) {
 function estimateEntryBytes(frames: ImageBitmap[]): number {
   if (frames.length === 0) return 0
   const f = frames[0]
-  return f.width * f.height * 4 * frames.length
+  // ImageBitmap GPU memory is 2-3x the raw RGBA size due to driver overhead,
+  // mipmaps, alignment padding. Use 2.5x multiplier so eviction math matches
+  // actual memory pressure the browser reports.
+  return Math.round(f.width * f.height * 4 * frames.length * 2.5)
 }
 
 // ── Playhead-proximity eviction ─────────────────────────────────
@@ -309,23 +312,33 @@ function cacheSet(key: string, entry: CacheEntry) {
   if (existing) { totalMemoryBytes -= existing.bytes; existing.frames.forEach((f) => f.close()) }
   memoryCache.set(key, entry)
   totalMemoryBytes += entry.bytes
-  // Evict farthest entries from playhead when at 80% of memory limit
-  // (GPU texture memory is ~2x the estimated RGBA bytes)
-  const evictionThreshold = MEMORY_LIMIT * 0.8
+  // GPU memory for ImageBitmap textures can be 2-4x the estimated RGBA bytes
+  // due to driver overhead, mipmapping, and padding. Evict aggressively at 60%.
+  const evictionThreshold = MEMORY_LIMIT * 0.6
   if (totalMemoryBytes <= evictionThreshold) return
 
   // Phase 1: evict outside the protection zone
   let attempts = 0
-  while (totalMemoryBytes > evictionThreshold && memoryCache.size > 1 && attempts < 50) {
+  while (totalMemoryBytes > evictionThreshold && memoryCache.size > 1 && attempts < 100) {
     if (!evictFarthest(key)) break
     attempts++
   }
-  if (totalMemoryBytes <= MEMORY_LIMIT) return
+  if (totalMemoryBytes <= MEMORY_LIMIT * 0.85) return
 
-  // Phase 2: over the hard limit — shrink protection to 5s (just the about-to-play clips)
-  while (totalMemoryBytes > MEMORY_LIMIT && memoryCache.size > 1 && attempts < 100) {
-    if (!evictFarthest(key, 5)) break
+  // Phase 2: over 85% — shrink protection to 10s
+  while (totalMemoryBytes > MEMORY_LIMIT * 0.7 && memoryCache.size > 1 && attempts < 200) {
+    if (!evictFarthest(key, 10)) break
     attempts++
+  }
+  if (totalMemoryBytes <= MEMORY_LIMIT * 0.95) return
+
+  // Phase 3: critical — evict everything except what's immediately playing
+  while (totalMemoryBytes > MEMORY_LIMIT * 0.7 && memoryCache.size > 1 && attempts < 500) {
+    if (!evictFarthest(key, 2)) break
+    attempts++
+  }
+  if (attempts >= 500) {
+    console.warn(`[frame-cache] eviction hit iteration limit — ${(totalMemoryBytes / 1024 / 1024 / 1024).toFixed(1)}GB still cached, ${memoryCache.size} entries`)
   }
 }
 
@@ -357,6 +370,14 @@ const MAX_DEFERRED_RETRIES = 6 // give up after ~30s of retries
 const deferredRetries = new Map<string, number>() // key -> retry count
 
 function enqueuePreload(fn: () => Promise<void>) {
+  // Hard memory guard: skip new preloads when we're at 95% of the limit.
+  // New decodes would push us over — let the eviction catch up first.
+  if (totalMemoryBytes > MEMORY_LIMIT * 0.95) {
+    if (preloadQueue.length === 0) {
+      console.warn(`[frame-cache] preload skipped: memory at ${(totalMemoryBytes / 1024 / 1024 / 1024).toFixed(1)}GB / ${(MEMORY_LIMIT / 1024 / 1024 / 1024).toFixed(1)}GB`)
+    }
+    return
+  }
   preloadQueue.push(fn)
   drainQueue()
 }
